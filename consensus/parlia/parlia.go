@@ -3,6 +3,7 @@ package parlia
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/systemcontracts"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -45,8 +47,9 @@ const (
 	checkpointInterval = 1024        // Number of blocks after which to save the snapshot to the database
 	defaultEpochLength = uint64(100) // Default number of blocks of checkpoint to update validatorSet from contract
 
-	extraVanity = 32 // Fixed number of extra-data prefix bytes reserved for signer vanity
-	extraSeal   = 65 // Fixed number of extra-data suffix bytes reserved for signer seal
+	extraVanity      = 32 // Fixed number of extra-data prefix bytes reserved for signer vanity
+	extraSeal        = 65 // Fixed number of extra-data suffix bytes reserved for signer seal
+	nextForkHashSize = 4  // Fixed number of extra-data suffix bytes reserved for nextForkHash.
 
 	validatorBytesLength = common.AddressLength
 	wiggleTime           = uint64(1) // second, Random delay (per signer) to allow concurrent signers
@@ -188,7 +191,8 @@ func ParliaRLP(header *types.Header, chainId *big.Int) []byte {
 type Parlia struct {
 	chainConfig *params.ChainConfig  // Chain config
 	config      *params.ParliaConfig // Consensus engine configuration parameters for parlia consensus
-	db          ethdb.Database       // Database to store and retrieve snapshot checkpoints
+	genesisHash common.Hash
+	db          ethdb.Database // Database to store and retrieve snapshot checkpoints
 
 	recentSnaps *lru.ARCCache // Snapshots for recent block to speed up
 	signatures  *lru.ARCCache // Signatures of recent blocks to speed up mining
@@ -214,6 +218,7 @@ func New(
 	chainConfig *params.ChainConfig,
 	db ethdb.Database,
 	ethAPI *ethapi.PublicBlockChainAPI,
+	genesisHash common.Hash,
 ) *Parlia {
 	// get parlia config
 	parliaConfig := chainConfig.Parlia
@@ -243,6 +248,7 @@ func New(
 	c := &Parlia{
 		chainConfig:     chainConfig,
 		config:          parliaConfig,
+		genesisHash:     genesisHash,
 		db:              db,
 		ethAPI:          ethAPI,
 		recentSnaps:     recentSnaps,
@@ -599,10 +605,12 @@ func (p *Parlia) Prepare(chain consensus.ChainReader, header *types.Header) erro
 	header.Difficulty = CalcDifficulty(snap, p.val)
 
 	// Ensure the extra data has all it's components
-	if len(header.Extra) < extraVanity {
-		header.Extra = append(header.Extra, bytes.Repeat([]byte{0x00}, extraVanity-len(header.Extra))...)
+	if len(header.Extra) < extraVanity-nextForkHashSize {
+		header.Extra = append(header.Extra, bytes.Repeat([]byte{0x00}, extraVanity-nextForkHashSize-len(header.Extra))...)
 	}
-	header.Extra = header.Extra[:extraVanity]
+	header.Extra = header.Extra[:extraVanity-nextForkHashSize]
+	nextForkHash := forkid.NextForkHash(p.chainConfig, p.genesisHash, number)
+	header.Extra = append(header.Extra, nextForkHash[:]...)
 
 	if number%p.config.Epoch == 0 {
 		newValidators, err := p.getCurrentValidators(header.ParentHash)
@@ -638,6 +646,16 @@ func (p *Parlia) Prepare(chain consensus.ChainReader, header *types.Header) erro
 // rewards given.
 func (p *Parlia) Finalize(chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs *[]*types.Transaction,
 	uncles []*types.Header, receipts *[]*types.Receipt, systemTxs *[]*types.Transaction, usedGas *uint64) error {
+	// warn if not in majority fork
+	number := header.Number.Uint64()
+	snap, err := p.snapshot(chain, number-1, header.ParentHash, nil)
+	if err != nil {
+		panic(err)
+	}
+	nextForkHash := forkid.NextForkHash(p.chainConfig, p.genesisHash, number)
+	if !snap.isMajorityFork(hex.EncodeToString(nextForkHash[:])) {
+		log.Debug("there is a possible fork, and your client is not the majority. Please check...", "nextForkHash", hex.EncodeToString(nextForkHash[:]))
+	}
 	// If the block is a epoch end block, verify the validator list
 	// The verification can only be done when the state is ready, it can't be done in VerifyHeader.
 	if header.Number.Uint64()%p.config.Epoch == 0 {
@@ -666,11 +684,6 @@ func (p *Parlia) Finalize(chain consensus.ChainReader, header *types.Header, sta
 		}
 	}
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
-		number := header.Number.Uint64()
-		snap, err := p.snapshot(chain, number-1, header.ParentHash, nil)
-		if err != nil {
-			panic(err)
-		}
 		spoiledVal := snap.supposeValidator()
 		signedRecently := false
 		for _, recent := range snap.Recents {
@@ -680,7 +693,7 @@ func (p *Parlia) Finalize(chain consensus.ChainReader, header *types.Header, sta
 			}
 		}
 		if !signedRecently {
-			log.Info("slash validator", "block hash", header.Hash(), "address", spoiledVal)
+			log.Trace("slash validator", "block hash", header.Hash(), "address", spoiledVal)
 			err = p.slash(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, false)
 			if err != nil {
 				// it is possible that slash validator failed because of the slash channel is disabled.
@@ -689,7 +702,7 @@ func (p *Parlia) Finalize(chain consensus.ChainReader, header *types.Header, sta
 		}
 	}
 	val := header.Coinbase
-	err := p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false)
+	err = p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false)
 	if err != nil {
 		panic(err)
 	}
@@ -767,6 +780,16 @@ func (p *Parlia) Authorize(val common.Address, signFn SignerFn, signTxFn SignerT
 	p.signTxFn = signTxFn
 }
 
+func (p *Parlia) Delay(chain consensus.ChainReader, header *types.Header) *time.Duration {
+	number := header.Number.Uint64()
+	snap, err := p.snapshot(chain, number-1, header.ParentHash, nil)
+	if err != nil {
+		return nil
+	}
+	delay := p.delayForRamanujanFork(snap, header)
+	return &delay
+}
+
 // Seal implements consensus.Engine, attempting to create a sealed block using
 // the local signing credentials.
 func (p *Parlia) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
@@ -837,6 +860,14 @@ func (p *Parlia) Seal(chain consensus.ChainReader, block *types.Block, results c
 	}()
 
 	return nil
+}
+
+func (p *Parlia) EnoughDistance(chain consensus.ChainReader, header *types.Header) bool {
+	snap, err := p.snapshot(chain, header.Number.Uint64()-1, header.ParentHash, nil)
+	if err != nil {
+		return true
+	}
+	return snap.enoughDistance(p.val)
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
@@ -947,11 +978,11 @@ func (p *Parlia) distributeIncoming(val common.Address, state *state.StateDB, he
 			if err != nil {
 				return err
 			}
-			log.Info("distribute to system reward pool", "block hash", header.Hash(), "amount", rewards)
+			log.Trace("distribute to system reward pool", "block hash", header.Hash(), "amount", rewards)
 			balance = balance.Sub(balance, rewards)
 		}
 	}
-	log.Info("distribute to validator contract", "block hash", header.Hash(), "amount", balance)
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "amount", balance)
 	return p.distributeToValidator(balance, val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining)
 }
 
@@ -999,7 +1030,7 @@ func (p *Parlia) initContract(state *state.StateDB, header *types.Header, chain 
 	for _, c := range contracts {
 		msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(c), data, common.Big0)
 		// apply message
-		log.Info("init contract", "block hash", header.Hash(), "contract", c)
+		log.Trace("init contract", "block hash", header.Hash(), "contract", c)
 		err = p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mining)
 		if err != nil {
 			return err
